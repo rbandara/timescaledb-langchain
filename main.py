@@ -7,6 +7,8 @@ from langchain_ollama import OllamaLLM
 from langchain.chains.sql_database.query import create_sql_query_chain
 from langchain.prompts import PromptTemplate
 import mplfinance as mpf
+import re
+
 
 # Setup LLM (Ollama with LLaMA3)
 llm = OllamaLLM(model="llama3")
@@ -20,40 +22,43 @@ engine = create_engine(DB_URI)
 SQL_PROMPT = PromptTemplate(
     input_variables=["input", "top_k", "table_info"],
     template="""You are a PostgreSQL expert. Given a natural language query about time-series financial data, generate a SQL query for a table named 'ohlcv_1m' with columns: bucket (timestamptz, start of 1-minute window), symbol (text), open (double precision), high (double precision), low (double precision), close (double precision), volume (double precision). The query should:
-    - Select bucket, open, high, low, close, volume.
-    - Filter by symbol (e.g., 'PLTR') when specified.
-    - Handle date ranges:
-        - For a single date (e.g., '2025-08-07'), include data from 00:00:00 to 23:59:59.999 on that date.
-        - For ranges like '5 days before and after', use PostgreSQL interval syntax with timestamptz.
-    - Order results by bucket ascending.
-    - Use the 'ticks' database.
-    - Limit to {top_k} rows if applicable.
-    - Assume the table contains 1-minute OHLC data, so no interval column exists.
+- Select bucket, open, high, low, close, volume.
+- Filter by symbol (e.g., 'PLTR') when specified.
+- Handle date ranges:
+    - For a single date (e.g., '2025-08-07'), include data from 00:00:00 to 23:59:59.999 on that date.
+    - For ranges like '5 days before and after', use PostgreSQL interval syntax with timestamptz.
+- Order results by bucket ascending.
+- Use the 'ticks' database.
+- Limit to {top_k} rows if applicable.
+- Assume the table contains 1-minute OHLC data, so no interval column exists.
 
-    Table info: {table_info}
+Table info: {table_info}
 
-    Query: {input}
+Query: {input}
 
-    Generate the SQL query and return only the SQL (no explanations or markdown).
+Generate the SQL query and return only the SQL (no explanations or markdown).
+Never use parameters or placeholders like $1, $2, :symbol, or :date. Always substitute actual values for symbol and date directly in the SQL. For queries like "5 days before and after", use INTERVAL arithmetic with timestamptz, e.g.:
+AND bucket >= '<date>'::timestamptz - INTERVAL '5 days'
+AND bucket < '<date>'::timestamptz + INTERVAL '6 days'
 
-    Example input: "show me data for 2025-08-07 for PLTR"
-    Example output: 
-    SELECT bucket, open, high, low, close, volume 
-    FROM ohlcv_1m 
-    WHERE symbol = 'PLTR' 
-    AND bucket >= '2025-08-07'::timestamptz 
-    AND bucket < '2025-08-08'::timestamptz 
-    ORDER BY bucket;
+Example input: "show me data for 2025-08-07 for PLTR"
+Example output: 
+SELECT bucket, open, high, low, close, volume 
+FROM ohlcv_1m 
+WHERE symbol = 'PLTR' 
+AND bucket >= '2025-08-07'::timestamptz 
+AND bucket < '2025-08-08'::timestamptz 
+ORDER BY bucket;
 
-    Example input: "Return PLTR data 5 days before and after 2025-09-10 for 1 min candles"
-    Example output: 
-    SELECT bucket, open, high, low, close, volume 
-    FROM ohlcv_1m 
-    WHERE symbol = 'PLTR' 
-    AND bucket >= '2025-09-10'::timestamptz - INTERVAL '5 days' 
-    AND bucket < '2025-09-10'::timestamptz + INTERVAL '6 days' 
-    ORDER BY bucket;
-    """
+Example input: "Return PLTR data 5 days before and after 2025-09-10 for 1 min candles"
+Example output: 
+SELECT bucket, open, high, low, close, volume 
+FROM ohlcv_1m 
+WHERE symbol = 'PLTR' 
+AND bucket >= '2025-09-10'::timestamptz - INTERVAL '5 days' 
+AND bucket < '2025-09-10'::timestamptz + INTERVAL '6 days' 
+ORDER BY bucket;
+"""
 )
 
 # Chain to generate SQL from natural language
@@ -61,39 +66,44 @@ sql_chain = create_sql_query_chain(llm, db, prompt=SQL_PROMPT)
 
 # Function to clean up generated SQL (removes markdown/code blocks if present)
 def clean_sql(sql_text):
-    if sql_text.startswith("```sql"):
-        sql_text = sql_text.split("```sql")[1]
-    if sql_text.endswith("```"):
-        sql_text = sql_text.split("```")[0]
-    sql_text = sql_text.strip()
-    # Remove LIMIT clause if present
-    import re
-    sql_text = re.sub(r'LIMIT\s+\d+\s*;?', '', sql_text, flags=re.IGNORECASE)
+    # Remove markdown/code blocks if present
+    sql_text = re.sub(r"```sql|```", "", sql_text, flags=re.IGNORECASE).strip()
+    # Remove any prefix before the actual SQL (e.g., "Generated SQL: ...")
+    # Find the first occurrence of SELECT and take everything from there
+    match = re.search(r"(SELECT[\s\S]+?;)", sql_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    # Fallback: return the original text if no SELECT found
     return sql_text.strip()
 
+def extract_symbol_from_sql(sql):
+    # Match WHERE symbol = 'SYMBOL'
+    match = re.search(r"WHERE\s+symbol\s*=\s*'([^']+)'", sql, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
 # Function to plot candlestick chart for verification
-def plot_candlestick(df, output_file="candlestick_chart.png"):
-    if not all(col in df.columns for col in ['bucket', 'open', 'high', 'low', 'close']):
-        print("Error: DataFrame must contain 'bucket', 'open', 'high', 'low', 'close' columns for plotting.")
-        return
+def plot_candlestick(df, symbol=None, description=None):
     
-    # Prepare DataFrame for mplfinance
-    df = df.copy()  # Avoid modifying original
-    df['bucket'] = pd.to_datetime(df['bucket'])
-    df.set_index('bucket', inplace=True)
-    df = df[['open', 'high', 'low', 'close', 'volume']] if 'volume' in df.columns else df[['open', 'high', 'low', 'close']]
-    
-    # Plot and save candlestick chart
-    mpf.plot(
+    # Prepare title and output file name
+    chart_title = f"Candlestick Chart for {symbol}" if symbol else "Candlestick Chart"
+    output_file = f"candlestick_chart_{symbol}.png" if symbol else "candlestick_chart.png"
+    # Prepare description text
+    desc_text = description if description else f"This chart represents 1-minute OHLCV time-series data for {symbol}."
+    # Plot and annotate
+    fig, axes = mpf.plot(
         df,
         type='candle',
-        style='charles',  # TradingView-like style
-        title='Candlestick Chart for Verification',
+        style='charles',
+        title=chart_title,
         ylabel='Price',
         volume=True if 'volume' in df.columns else False,
-        savefig=output_file
+        returnfig=True
     )
-    print(f"Candlestick chart saved to {output_file}")
+    fig.text(0.5, 0.01, desc_text, ha='center', fontsize=10)
+    fig.savefig(output_file)
+    print(f"{chart_title} saved to {output_file} with description.")
 
 def main(args=None):
     # Parse command-line arguments
@@ -106,24 +116,27 @@ def main(args=None):
     print(f"Processing query: {query}")
     
     # Generate SQL from the natural language query
-    sql = sql_chain.invoke({"question": query})  # Removed top_k
+    sql = sql_chain.invoke({"question": query}) 
     sql = clean_sql(sql)
     print(f"Generated SQL: {sql}")
+
+    # Extract symbol from SQL
+    symbol = extract_symbol_from_sql(sql)
     
     # Execute SQL and return results as Pandas DataFrame
     try:
         df = pd.read_sql(sql, engine)
-        # Convert 'bucket' to datetime if not already
         if 'bucket' in df.columns:
             df['bucket'] = pd.to_datetime(df['bucket'])
+            df = df.set_index('bucket')
         print("\nDataFrame output:")
         print(df)
         
         # Plot if --plot flag is provided
         if args.plot:
-            plot_candlestick(df)
+            plot_candlestick(df, symbol=symbol, description=query)
         
-        return df  # Return for potential service wrapper
+        return df
     except Exception as e:
         print(f"Error executing SQL: {e}")
         return
